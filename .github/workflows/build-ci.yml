@@ -1,0 +1,107 @@
+name: Build CI
+
+on:
+  push:
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.mdx'
+      - 'docs/**'
+      - 'fastlane/metadata/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Required repository secrets for the release build:
+#   JKS_KEYSTORE_BASE64     Base64-encoded .jks keystore
+#   JKS_KEYSTORE_PASSWORD   Keystore password
+#   JKS_KEY_ALIAS           Private-key alias
+#   JKS_KEY_PASSWORD        Private-key password
+jobs:
+  build:
+    name: Build Debug and Release APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-36 build-tools;35.0.0
+
+      - name: Build Debug APK
+        run: ./gradlew :app:assembleGithubDebug --stacktrace
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarnhelm-github-debug-apk
+          path: app/build/outputs/apk/github/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Configure JKS signing key
+        shell: bash
+        env:
+          JKS_KEYSTORE_BASE64: ${{ secrets.JKS_KEYSTORE_BASE64 }}
+          JKS_KEYSTORE_PASSWORD: ${{ secrets.JKS_KEYSTORE_PASSWORD }}
+          JKS_KEY_ALIAS: ${{ secrets.JKS_KEY_ALIAS }}
+          JKS_KEY_PASSWORD: ${{ secrets.JKS_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for required_secret in \
+            JKS_KEYSTORE_BASE64 \
+            JKS_KEYSTORE_PASSWORD \
+            JKS_KEY_ALIAS \
+            JKS_KEY_PASSWORD; do
+            if [[ -z "${!required_secret}" ]]; then
+              echo "Missing required repository secret: ${required_secret}" >&2
+              exit 1
+            fi
+          done
+
+          jks_file="$RUNNER_TEMP/tarnhelm-signing.jks"
+          printf '%s' "$JKS_KEYSTORE_BASE64" | base64 --decode > "$jks_file"
+
+          gradle_user_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          mkdir -p "$gradle_user_home"
+          {
+            printf 'android.injected.signing.store.file=%s\n' "$jks_file"
+            printf 'android.injected.signing.store.password=%s\n' "$JKS_KEYSTORE_PASSWORD"
+            printf 'android.injected.signing.key.alias=%s\n' "$JKS_KEY_ALIAS"
+            printf 'android.injected.signing.key.password=%s\n' "$JKS_KEY_PASSWORD"
+            printf 'android.injected.signing.store.type=JKS\n'
+          } > "$gradle_user_home/gradle.properties"
+          chmod 600 "$gradle_user_home/gradle.properties"
+
+      - name: Build Release APK
+        run: ./gradlew :app:assembleGithubRelease --stacktrace
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarnhelm-github-release-apk
+          path: app/build/outputs/apk/github/release/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary signing files
+        if: always()
+        shell: bash
+        run: |
+          gradle_user_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          rm -f "$RUNNER_TEMP/tarnhelm-signing.jks" "$gradle_user_home/gradle.properties"
